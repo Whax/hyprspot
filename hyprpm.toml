@@ -1,0 +1,9 @@
+[repository]
+name = "hyprspot"
+authors = ["whax"]
+description = "A tiny focus indicator dot in the corner of the screen."
+
+[hyprspot]
+description = "Focus indicator overlay (dot or PNG) in a screen corner."
+output = "hyprspot.so"
+build = ["make hyprspot.so"]
