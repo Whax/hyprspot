@@ -99,8 +99,9 @@ static void loadImageIfNeeded(const std::string& path) {
 }
 
 // Compute the dot box anchored to the focused window's geometry.
-// position and origin are both in [-1, 1]^2 (-1 = top/left edge, +1 = bottom/right).
-static CBox computeBox(PHLWINDOW pWindow) {
+// If pMonitor is provided, the box is returned in MONITOR-LOCAL coords (what
+// the render pass expects). Otherwise it's in GLOBAL coords (used by damageBox).
+static CBox computeBox(PHLWINDOW pWindow, PHLMONITOR pMonitor = nullptr) {
     const auto     vSize    = g_cvSize->value();
     const auto     vPadding = g_cvOffset->value();
     const Vector2D size{vSize.x, vSize.y};
@@ -117,8 +118,11 @@ static CBox computeBox(PHLWINDOW pWindow) {
         orig             = {vOrig.x, vOrig.y};
     }
 
-    const Vector2D winPos  = pWindow->m_realPosition->value();
+    Vector2D       winPos  = pWindow->m_realPosition->value();
     const Vector2D winSize = pWindow->m_realSize->value();
+
+    if (pMonitor)
+        winPos = winPos - pMonitor->m_position;
 
     const Vector2D anchor{winPos.x + winSize.x * (pos.x + 1.0) * 0.5,
                           winPos.y + winSize.y * (pos.y + 1.0) * 0.5};
@@ -159,7 +163,7 @@ class CSpotDecoration : public IHyprWindowDecoration {
 
         loadImageIfNeeded(g_cvImage->value());
 
-        const CBox box   = computeBox(pWindow);
+        const CBox box   = computeBox(pWindow, pMonitor);
         const int  round = static_cast<int>(g_cvRounding->value());
 
         if (g_texture) {
