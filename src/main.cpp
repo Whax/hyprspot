@@ -10,6 +10,7 @@
 #include <hyprland/src/render/decorations/DecorationPositioner.hpp>
 #include <hyprland/src/render/pass/RectPassElement.hpp>
 #include <hyprland/src/render/pass/TexPassElement.hpp>
+#include <hyprland/src/render/pass/BorderPassElement.hpp>
 #include <hyprland/src/config/values/types/Vec2Value.hpp>
 #include <hyprland/src/config/values/types/FloatValue.hpp>
 #include <hyprland/src/config/values/types/ColorValue.hpp>
@@ -21,6 +22,8 @@
 #include <hyprland/src/SharedDefs.hpp>
 
 #include <cairo/cairo.h>
+#include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <optional>
 #include <unordered_map>
@@ -44,6 +47,16 @@ static SP<cv::CVec2Value>   g_cvOffset;
 static SP<cv::CColorValue>  g_cvColor;
 static SP<cv::CFloatValue>  g_cvRounding;
 static SP<cv::CStringValue> g_cvImage;
+
+// --- Focus pulse (transient ring on focus change) ---
+static SP<cv::CFloatValue> g_cvPulseDuration;  // ms, 0 disables
+static SP<cv::CColorValue> g_cvPulseColor;
+static SP<cv::CFloatValue> g_cvPulseThickness; // px
+static SP<cv::CFloatValue> g_cvPulseExpand;    // px the ring grows outward over its life
+static SP<cv::CFloatValue> g_cvPulseRounding;  // px
+
+static PHLWINDOWREF                          g_pulseWindow;
+static std::chrono::steady_clock::time_point g_pulseStart;
 
 // Returns {position, origin} for a named anchor, or std::nullopt if name is empty/unknown.
 static std::optional<std::pair<Vector2D, Vector2D>> anchorFromName(const std::string& name) {
@@ -180,6 +193,45 @@ class CSpotDecoration : public IHyprWindowDecoration {
             data.round = round;
             g_pHyprRenderer->m_renderPass.add(makeUnique<CRectPassElement>(data));
         }
+
+        drawPulse(pWindow, pMonitor, a);
+    }
+
+    // Transient ring that expands outward and fades over pulse_duration ms,
+    // retriggered every time this window becomes focused. Self-damages each
+    // frame so the animation keeps ticking without Hyprland's anim system.
+    static void drawPulse(PHLWINDOW pWindow, PHLMONITOR pMonitor, float a) {
+        const float durMs = g_cvPulseDuration->value();
+        if (durMs <= 0.f)
+            return;
+
+        auto pulsed = g_pulseWindow.lock();
+        if (!pulsed || pulsed != pWindow)
+            return;
+
+        const auto  now     = std::chrono::steady_clock::now();
+        const float elapsed = std::chrono::duration<float, std::milli>(now - g_pulseStart).count();
+        const float p       = elapsed / durMs;
+        if (p >= 1.f)
+            return;
+
+        const float ease  = 1.f - p;
+        const float alpha = ease * ease;                 // quadratic fade-out
+        const float grow  = g_cvPulseExpand->value() * p; // expand outward over life
+
+        const Vector2D winPos  = pWindow->m_realPosition->value() - pMonitor->m_position;
+        const Vector2D winSize = pWindow->m_realSize->value();
+
+        CBorderPassElement::SBorderData bd;
+        bd.box        = CBox{winPos.x - grow, winPos.y - grow, winSize.x + 2 * grow, winSize.y + 2 * grow};
+        bd.grad1      = Config::CGradientValueData(CHyprColor{static_cast<uint64_t>(g_cvPulseColor->value())});
+        bd.a          = alpha * a;
+        bd.borderSize = static_cast<int>(g_cvPulseThickness->value());
+        bd.round      = static_cast<int>(g_cvPulseRounding->value() + grow);
+        g_pHyprRenderer->m_renderPass.add(makeUnique<CBorderPassElement>(bd));
+
+        // Keep the animation alive until alpha reaches 0.
+        g_pHyprRenderer->damageMonitor(pMonitor);
     }
 
     virtual eDecorationType  getDecorationType() override { return DECORATION_CUSTOM; }
@@ -224,6 +276,12 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_cvRounding = makeShared<cv::CFloatValue>("plugin:hyprspot:rounding", "Corner rounding in pixels", 6.0f);
     g_cvImage    = makeShared<cv::CStringValue>("plugin:hyprspot:image", "Path to a PNG to draw instead of the dot (empty = solid color)", std::string{""});
 
+    g_cvPulseDuration  = makeShared<cv::CFloatValue>("plugin:hyprspot:pulse_duration", "Focus pulse duration in ms (0 disables the pulse)", 400.0f);
+    g_cvPulseColor     = makeShared<cv::CColorValue>("plugin:hyprspot:pulse_color", "Focus pulse ring color (hex 0xAARRGGBB)", Config::INTEGER{0xFFAB66FF});
+    g_cvPulseThickness = makeShared<cv::CFloatValue>("plugin:hyprspot:pulse_thickness", "Focus pulse ring thickness in px", 3.0f);
+    g_cvPulseExpand    = makeShared<cv::CFloatValue>("plugin:hyprspot:pulse_expand", "How far the ring expands outward over its life, in px", 12.0f);
+    g_cvPulseRounding  = makeShared<cv::CFloatValue>("plugin:hyprspot:pulse_rounding", "Base ring corner rounding in px", 10.0f);
+
     HyprlandAPI::addConfigValueV2(handle, g_cvSize);
     HyprlandAPI::addConfigValueV2(handle, g_cvAnchor);
     HyprlandAPI::addConfigValueV2(handle, g_cvPosition);
@@ -232,12 +290,19 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addConfigValueV2(handle, g_cvColor);
     HyprlandAPI::addConfigValueV2(handle, g_cvRounding);
     HyprlandAPI::addConfigValueV2(handle, g_cvImage);
+    HyprlandAPI::addConfigValueV2(handle, g_cvPulseDuration);
+    HyprlandAPI::addConfigValueV2(handle, g_cvPulseColor);
+    HyprlandAPI::addConfigValueV2(handle, g_cvPulseThickness);
+    HyprlandAPI::addConfigValueV2(handle, g_cvPulseExpand);
+    HyprlandAPI::addConfigValueV2(handle, g_cvPulseRounding);
 
     g_listenerOpen = Event::bus()->m_events.window.open.listen([](PHLWINDOW w) {
         attachDecoration(w);
     });
 
-    g_listenerActive = Event::bus()->m_events.window.active.listen([](PHLWINDOW, Desktop::eFocusReason) {
+    g_listenerActive = Event::bus()->m_events.window.active.listen([](PHLWINDOW w, Desktop::eFocusReason) {
+        g_pulseWindow = w;
+        g_pulseStart  = std::chrono::steady_clock::now();
         if (g_pCompositor) {
             for (auto& m : g_pCompositor->m_monitors)
                 g_pHyprRenderer->damageMonitor(m);
@@ -267,4 +332,10 @@ APICALL EXPORT void PLUGIN_EXIT() {
     g_cvColor.reset();
     g_cvRounding.reset();
     g_cvImage.reset();
+    g_cvPulseDuration.reset();
+    g_cvPulseColor.reset();
+    g_cvPulseThickness.reset();
+    g_cvPulseExpand.reset();
+    g_cvPulseRounding.reset();
+    g_pulseWindow.reset();
 }
