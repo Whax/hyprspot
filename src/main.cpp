@@ -17,8 +17,11 @@
 #include <hyprland/src/config/values/types/StringValue.hpp>
 #include <hyprland/src/desktop/DesktopTypes.hpp>
 #include <hyprland/src/desktop/view/Window.hpp>
+#include <hyprland/src/desktop/state/FocusState.hpp>
+#include <hyprland/src/desktop/state/WindowState.hpp>
+#include <hyprland/src/state/MonitorState.hpp>
 #include <hyprland/src/helpers/Color.hpp>
-#include <hyprland/src/helpers/Monitor.hpp>
+#include <hyprland/src/output/Monitor.hpp>
 #include <hyprland/src/SharedDefs.hpp>
 
 #include <cairo/cairo.h>
@@ -116,8 +119,8 @@ static void loadImageIfNeeded(const std::string& path) {
 // titlebar), in GLOBAL coords. This makes the indicator wrap the window AND
 // its bar instead of just the shrunken content area.
 static CBox windowOuterBox(PHLWINDOW pWindow) {
-    Vector2D pos  = pWindow->m_realPosition->value();
-    Vector2D size = pWindow->m_realSize->value();
+    Vector2D pos  = pWindow->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
+    Vector2D size = pWindow->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
     if (g_pDecorationPositioner) {
         const auto res = g_pDecorationPositioner->getWindowDecorationReserved(pWindow);
         pos  = pos - res.topLeft;
@@ -192,7 +195,7 @@ class CSpotDecoration : public IHyprWindowDecoration {
         auto pWindow = m_window.lock();
         if (!pWindow || !pMonitor)
             return;
-        if (!g_pCompositor->isWindowActive(pWindow))
+        if (!Desktop::focusState()->isWindowActive(pWindow))
             return;
 
         loadImageIfNeeded(g_cvImage->value());
@@ -345,16 +348,12 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_listenerActive = Event::bus()->m_events.window.active.listen([](PHLWINDOW w, Desktop::eFocusReason) {
         g_pulseWindow = w;
         g_pulseStart  = std::chrono::steady_clock::now();
-        if (g_pCompositor) {
-            for (auto& m : g_pCompositor->m_monitors)
-                g_pHyprRenderer->damageMonitor(m);
-        }
+        for (auto& m : State::monitorState()->monitors())
+            g_pHyprRenderer->damageMonitor(m);
     });
 
-    if (g_pCompositor) {
-        for (const auto& w : g_pCompositor->m_windows)
-            attachDecoration(w);
-    }
+    for (const auto& w : Desktop::windowState()->windows())
+        attachDecoration(w);
 
     HyprlandAPI::reloadConfig();
 
