@@ -47,6 +47,7 @@ static SP<cv::CVec2Value>   g_cvOffset;
 static SP<cv::CColorValue>  g_cvColor;
 static SP<cv::CFloatValue>  g_cvRounding;
 static SP<cv::CStringValue> g_cvImage;
+static SP<cv::CFloatValue>  g_cvDotAnimDuration; // ms, appear animation (0 = instant)
 
 // --- Focus pulse (transient ring on focus change) ---
 static SP<cv::CFloatValue> g_cvPulseDuration;  // ms, 0 disables
@@ -111,13 +112,27 @@ static void loadImageIfNeeded(const std::string& path) {
     cairo_surface_destroy(surface);
 }
 
+// Window box expanded by its reserved decoration extents (e.g. a hyprtabbed
+// titlebar), in GLOBAL coords. This makes the indicator wrap the window AND
+// its bar instead of just the shrunken content area.
+static CBox windowOuterBox(PHLWINDOW pWindow) {
+    Vector2D pos  = pWindow->m_realPosition->value();
+    Vector2D size = pWindow->m_realSize->value();
+    if (g_pDecorationPositioner) {
+        const auto res = g_pDecorationPositioner->getWindowDecorationReserved(pWindow);
+        pos  = pos - res.topLeft;
+        size = size + res.topLeft + res.bottomRight;
+    }
+    return CBox{pos, size};
+}
+
 // Compute the dot box anchored to the focused window's geometry.
 // If pMonitor is provided, the box is returned in MONITOR-LOCAL coords (what
 // the render pass expects). Otherwise it's in GLOBAL coords (used by damageBox).
-static CBox computeBox(PHLWINDOW pWindow, PHLMONITOR pMonitor = nullptr) {
+static CBox computeBox(PHLWINDOW pWindow, PHLMONITOR pMonitor = nullptr, double scale = 1.0) {
     const auto     vSize    = g_cvSize->value();
     const auto     vPadding = g_cvOffset->value();
-    const Vector2D size{vSize.x, vSize.y};
+    const Vector2D size{vSize.x, vSize.y}; // full size; the anim scale is applied around the center below
     const Vector2D padding{vPadding.x, vPadding.y};
 
     Vector2D pos, orig;
@@ -131,8 +146,9 @@ static CBox computeBox(PHLWINDOW pWindow, PHLMONITOR pMonitor = nullptr) {
         orig             = {vOrig.x, vOrig.y};
     }
 
-    Vector2D       winPos  = pWindow->m_realPosition->value();
-    const Vector2D winSize = pWindow->m_realSize->value();
+    const CBox     outer   = windowOuterBox(pWindow);
+    Vector2D       winPos  = outer.pos();
+    const Vector2D winSize = outer.size();
 
     if (pMonitor)
         winPos = winPos - pMonitor->m_position;
@@ -147,7 +163,12 @@ static CBox computeBox(PHLWINDOW pWindow, PHLMONITOR pMonitor = nullptr) {
     const Vector2D inset{-pos.x * padding.x, -pos.y * padding.y};
 
     const Vector2D topLeft = anchor - pivotOffset + inset;
-    return CBox{topLeft.x, topLeft.y, size.x, size.y};
+
+    // Apply the appear animation by scaling around the dot's CENTER, so the pop
+    // grows from the middle outward regardless of which corner it's anchored to.
+    const Vector2D center  = topLeft + size * 0.5;
+    const Vector2D scaled  = size * scale;
+    return CBox{center.x - scaled.x * 0.5, center.y - scaled.y * 0.5, scaled.x, scaled.y};
 }
 
 class CSpotDecoration : public IHyprWindowDecoration {
@@ -176,20 +197,38 @@ class CSpotDecoration : public IHyprWindowDecoration {
 
         loadImageIfNeeded(g_cvImage->value());
 
-        const CBox box   = computeBox(pWindow, pMonitor);
-        const int  round = static_cast<int>(g_cvRounding->value());
+        // Appear animation, retriggered each time the window gains focus:
+        // fade in + a subtle pop (scale 0 -> 1 with overshoot), anchored to the
+        // dot's corner. Self-damages while running so it ticks on its own.
+        float dotA = 1.f, dotScale = 1.f;
+        const float animMs = g_cvDotAnimDuration->value();
+        if (animMs > 0.f) {
+            const auto  now = std::chrono::steady_clock::now();
+            const float el  = std::chrono::duration<float, std::milli>(now - g_pulseStart).count();
+            const float p   = el / animMs;
+            if (p < 1.f) {
+                dotA = 1.f - (1.f - p) * (1.f - p); // ease-out fade in
+                // easeOutBack: overshoots slightly past 1 then settles -> pop
+                const float c1 = 1.70158f, c3 = c1 + 1.f, q = p - 1.f;
+                dotScale = std::max(0.f, 1.f + c3 * q * q * q + c1 * q * q);
+                g_pHyprRenderer->damageMonitor(pMonitor);
+            }
+        }
+
+        const CBox box   = computeBox(pWindow, pMonitor, dotScale);
+        const int  round = static_cast<int>(g_cvRounding->value() * dotScale);
 
         if (g_texture) {
             CTexPassElement::SRenderData data;
             data.tex   = g_texture;
             data.box   = box;
-            data.a     = a;
+            data.a     = a * dotA;
             data.round = round;
             g_pHyprRenderer->m_renderPass.add(makeUnique<CTexPassElement>(data));
         } else {
             CRectPassElement::SRectData data;
             data.box   = box;
-            data.color = CHyprColor{static_cast<uint64_t>(g_cvColor->value())}.modifyA(a);
+            data.color = CHyprColor{static_cast<uint64_t>(g_cvColor->value())}.modifyA(a * dotA);
             data.round = round;
             g_pHyprRenderer->m_renderPass.add(makeUnique<CRectPassElement>(data));
         }
@@ -219,8 +258,9 @@ class CSpotDecoration : public IHyprWindowDecoration {
         const float alpha = ease * ease;                 // quadratic fade-out
         const float grow  = g_cvPulseExpand->value() * p; // expand outward over life
 
-        const Vector2D winPos  = pWindow->m_realPosition->value() - pMonitor->m_position;
-        const Vector2D winSize = pWindow->m_realSize->value();
+        const CBox     outer   = windowOuterBox(pWindow);
+        const Vector2D winPos  = outer.pos() - pMonitor->m_position;
+        const Vector2D winSize = outer.size();
 
         CBorderPassElement::SBorderData bd;
         bd.box        = CBox{winPos.x - grow, winPos.y - grow, winSize.x + 2 * grow, winSize.y + 2 * grow};
@@ -275,6 +315,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_cvColor    = makeShared<cv::CColorValue>("plugin:hyprspot:color", "Dot color (hex 0xAARRGGBB)", Config::INTEGER{0xFFFFFFFF});
     g_cvRounding = makeShared<cv::CFloatValue>("plugin:hyprspot:rounding", "Corner rounding in pixels", 6.0f);
     g_cvImage    = makeShared<cv::CStringValue>("plugin:hyprspot:image", "Path to a PNG to draw instead of the dot (empty = solid color)", std::string{""});
+    g_cvDotAnimDuration = makeShared<cv::CFloatValue>("plugin:hyprspot:dot_anim_duration", "Dot appear animation duration in ms on focus (0 = instant)", 200.0f);
 
     g_cvPulseDuration  = makeShared<cv::CFloatValue>("plugin:hyprspot:pulse_duration", "Focus pulse duration in ms (0 disables the pulse)", 400.0f);
     g_cvPulseColor     = makeShared<cv::CColorValue>("plugin:hyprspot:pulse_color", "Focus pulse ring color (hex 0xAARRGGBB)", Config::INTEGER{0xFFAB66FF});
@@ -290,6 +331,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addConfigValueV2(handle, g_cvColor);
     HyprlandAPI::addConfigValueV2(handle, g_cvRounding);
     HyprlandAPI::addConfigValueV2(handle, g_cvImage);
+    HyprlandAPI::addConfigValueV2(handle, g_cvDotAnimDuration);
     HyprlandAPI::addConfigValueV2(handle, g_cvPulseDuration);
     HyprlandAPI::addConfigValueV2(handle, g_cvPulseColor);
     HyprlandAPI::addConfigValueV2(handle, g_cvPulseThickness);
@@ -332,6 +374,7 @@ APICALL EXPORT void PLUGIN_EXIT() {
     g_cvColor.reset();
     g_cvRounding.reset();
     g_cvImage.reset();
+    g_cvDotAnimDuration.reset();
     g_cvPulseDuration.reset();
     g_cvPulseColor.reset();
     g_cvPulseThickness.reset();
